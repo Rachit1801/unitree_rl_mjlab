@@ -15,6 +15,7 @@ from .unitree_g1.g1_constants import (
 )
 from .unitree_g1.g1_constants import (
   get_g1_robot_cfg as get_g1_robot_cfg,
+  get_g1_platform_robot_cfg as get_g1_platform_robot_cfg,
 )
 
 from .unitree_g1.g1_23dof_constants import (

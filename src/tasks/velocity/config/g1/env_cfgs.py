@@ -3,10 +3,14 @@
 from src.assets.robots import (
   G1_ACTION_SCALE,
   get_g1_robot_cfg,
+  get_g1_platform_robot_cfg,
 )
+from mjlab.managers.observation_manager import ObservationTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
@@ -195,5 +199,165 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist_cmd.ranges.lin_vel_x = (-0.5, 1.0)
     twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
     twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
+
+  return cfg
+
+
+def unitree_g1_platform_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Create Unitree G1 moving platform configuration.
+
+  The platform moves with random velocities during training so the robot
+  learns to balance on moving surfaces (e.g. bus, train). Velocity tracking
+  and foot slip rewards use platform-relative computations.
+  """
+  cfg = unitree_g1_flat_env_cfg(play=play)
+
+  import src.tasks.velocity.mdp as src_mdp
+
+  # 1. Load robot config with the platform and enable platform collisions.
+  robot_cfg = get_g1_platform_robot_cfg()
+  from mjlab.utils.spec_config import CollisionCfg
+  platform_collision = CollisionCfg(
+    geom_names_expr=(".*_collision", "platform"),
+    condim={r"^(left|right)_foot[1-7]_collision$": 3, ".*_collision": 1, "platform": 3},
+    priority={r"^(left|right)_foot[1-7]_collision$": 1, "platform": 1},
+    friction={r"^(left|right)_foot[1-7]_collision$": (0.6,), "platform": (0.6,)},
+  )
+  robot_cfg.collisions = (platform_collision,)
+  cfg.scene.entities = {"robot": robot_cfg}
+
+  # 2. Disable default terrain.
+  cfg.scene.terrain = None
+
+  # 3. Update contact sensor pattern to use prefixed platform name.
+  for sensor in cfg.scene.sensors or ():
+    if sensor.name == "feet_ground_contact":
+      sensor.secondary.pattern = "robot/platform"
+
+  # 4. Filter actor and critic joint observation spaces back to 29 joints.
+  #    (Platform slide joints must not appear in the observation space.)
+  for group_name in ["actor", "critic"]:
+    group = cfg.observations[group_name]
+
+    if "joint_pos" in group.terms:
+      term = group.terms["joint_pos"]
+      group.terms["joint_pos"] = ObservationTermCfg(
+        func=term.func,
+        noise=term.noise,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*_joint",))}
+      )
+
+    if "joint_vel" in group.terms:
+      term = group.terms["joint_vel"]
+      group.terms["joint_vel"] = ObservationTermCfg(
+        func=term.func,
+        noise=term.noise,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*_joint",))}
+      )
+
+  # 5. Filter event joint resets to robot joints only.
+  if "reset_robot_joints" in cfg.events:
+    cfg.events["reset_robot_joints"].params["asset_cfg"].joint_names = (".*_joint",)
+
+  # 6. Filter posture and joint-limit rewards to prevent tracking the platform joints.
+  if "pose" in cfg.rewards:
+    cfg.rewards["pose"].params["asset_cfg"].joint_names = ".*_joint"
+  if "stand_still" in cfg.rewards:
+    cfg.rewards["stand_still"].params["asset_cfg"].joint_names = ".*_joint"
+  if "joint_pos_limits" in cfg.rewards:
+    cfg.rewards["joint_pos_limits"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=".*_joint")
+  if "joint_acc_l2" in cfg.rewards:
+    cfg.rewards["joint_acc_l2"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=".*_joint")
+
+  # 7. Explicitly filter action space to robot joints only.
+  joint_pos_action = cfg.actions["joint_pos"]
+  assert isinstance(joint_pos_action, JointPositionActionCfg)
+  joint_pos_action.actuator_names = (".*_joint",)
+
+  # ------------------------------------------------------------------
+  # 8. Moving platform events.
+  # ------------------------------------------------------------------
+
+  # 8a. Step event: smoothly ramp platform velocity toward random targets.
+  cfg.events["set_platform_velocity"] = EventTermCfg(
+    func=src_mdp.set_platform_velocity,
+    mode="step",
+    params={
+      "velocity_range": {"x": (-0.3, 0.3), "y": (-0.3, 0.3)},
+      "ramp_rate": 0.5,
+      "hold_time_s": (2.0, 5.0),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=("platform_x", "platform_y")),
+    },
+  )
+
+  # 8b. Reset event: zero platform joint position & velocity each episode.
+  cfg.events["reset_platform_joints"] = EventTermCfg(
+    func=src_mdp.reset_joints_by_offset,
+    mode="reset",
+    params={
+      "position_range": (0.0, 0.0),
+      "velocity_range": (0.0, 0.0),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=("platform_x", "platform_y")),
+    },
+  )
+
+  # ------------------------------------------------------------------
+  # 9. Platform-relative rewards.
+  # ------------------------------------------------------------------
+
+  # 9a. Replace velocity tracking with platform-relative version.
+  import math
+  cfg.rewards["track_linear_velocity"] = RewardTermCfg(
+    func=src_mdp.track_linear_velocity_platform_relative,
+    weight=1.0,
+    params={"command_name": "twist", "std": math.sqrt(0.25)},
+  )
+
+  # 9b. Replace foot slip with platform-relative version.
+  site_names = ("left_foot", "right_foot")
+  cfg.rewards["foot_slip"] = RewardTermCfg(
+    func=src_mdp.feet_slip_platform_relative,
+    weight=-0.25,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "command_name": "twist",
+      "command_threshold": 0.1,
+      "asset_cfg": SceneEntityCfg("robot", site_names=site_names),
+    },
+  )
+
+  # 9c. Adjust action rate penalty for platform walking.
+  if "action_rate_l2" in cfg.rewards:
+    cfg.rewards["action_rate_l2"].weight = -0.03
+
+  # ------------------------------------------------------------------
+  # 10. Platform velocity curriculum (speed + sharpness).
+  # ------------------------------------------------------------------
+  cfg.curriculum["platform_velocity"] = CurriculumTermCfg(
+    func=src_mdp.platform_velocity_curriculum,
+    params={
+      "event_name": "set_platform_velocity",
+      "velocity_stages": [
+        # Stage 0: Gentle, slow platform motion.
+        {"step": 10000 * 24,
+         "x": (-0.8, 0.8), "y": (-0.8, 0.8),
+         "ramp_rate": 5.0},
+        # Stage 1 (~5k iters): Medium speed, moderate ramp.
+        {"step": 10500 * 24,
+         "x": (-1.4, 1.4), "y": (-1.4, 1.4),
+         "ramp_rate": 10.0},
+        # Stage 2 (~10k iters): Full speed, sharp changes.
+        {"step": 12000 * 24,
+         "x": (-2.0, 2.0), "y": (-2.0, 2.0),
+         "ramp_rate": 20.0},
+      ],
+    },
+  )
+
+  # Apply play mode overrides for the platform.
+  if play:
+    # Disable platform velocity randomization during play.
+    cfg.events.pop("set_platform_velocity", None)
+    cfg.curriculum.pop("platform_velocity", None)
 
   return cfg
