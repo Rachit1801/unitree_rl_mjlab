@@ -1,0 +1,22 @@
+<mujoco model="platform_g1">
+  <compiler angle="radian" meshdir="assets"/>
+  <include file="g1.xml"/>
+
+  <asset>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <body name="platform" pos="0 0 -0.01">
+      <joint name="platform_x" type="slide" axis="1 0 0" limited="false" damping="50"/>
+      <joint name="platform_y" type="slide" axis="0 1 0" limited="false" damping="50"/>
+      <geom name="platform" type="box" size="10 10 0.01" material="groundplane"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <velocity name="platform_x_vel" joint="platform_x" kv="100000"/>
+    <velocity name="platform_y_vel" joint="platform_y" kv="100000"/>
+  </actuator>
+</mujoco>

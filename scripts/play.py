@@ -39,6 +39,68 @@ class PlayConfig:
   _demo_mode: tyro.conf.Suppress[bool] = False
 
 
+class PlatformViserPlayViewer(ViserPlayViewer):
+  """Subclass of ViserPlayViewer to add manual platform velocity sliders."""
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._platform_vx_slider = None
+    self._platform_vy_slider = None
+    self._platform_global_ctrl_ids = None
+    self._robot = None
+
+  def setup(self) -> None:
+    super().setup()
+
+    # Access the unwrapped environment and robot entity.
+    env = self.env.unwrapped
+    robot = env.scene["robot"]
+    try:
+      # Find local actuator IDs for platform velocities
+      actuator_ids, _ = robot.find_actuators(("platform_x_vel", "platform_y_vel"))
+      self._robot = robot
+      # Get the global ctrl indices compiled into the model
+      self._platform_global_ctrl_ids = robot.data.indexing.ctrl_ids[actuator_ids]
+
+      # Add a GUI folder for Platform Control under the "Controls" tab
+      with self._server.gui.add_folder("Platform Control"):
+        self._platform_vx_slider = self._server.gui.add_slider(
+          "Platform Velocity X (m/s)",
+          min=-2.0,
+          max=2.0,
+          step=0.05,
+          initial_value=0.0,
+        )
+        self._platform_vy_slider = self._server.gui.add_slider(
+          "Platform Velocity Y (m/s)",
+          min=-2.0,
+          max=2.0,
+          step=0.05,
+          initial_value=0.0,
+        )
+
+        # Quick zeroing button
+        zero_btn = self._server.gui.add_button("Zero Platform Speed")
+        @zero_btn.on_click
+        def _(_) -> None:
+          self._platform_vx_slider.value = 0.0
+          self._platform_vy_slider.value = 0.0
+
+      print("[INFO] Registered manual platform controls in Viser viewer.")
+    except Exception as e:
+      print(f"[INFO] Platform actuators not found or not compiled, skipping platform GUI: {e}")
+
+  def sync_viewer_to_env(self) -> None:
+    super().sync_viewer_to_env()
+    # Write the slider velocities to the platform's native actuators every step
+    if self._platform_global_ctrl_ids is not None and self._robot is not None:
+      vx = self._platform_vx_slider.value
+      vy = self._platform_vy_slider.value
+      device = self._robot.data.data.ctrl.device
+      vel = torch.tensor([vx, vy], device=device, dtype=torch.float)
+      self._robot.data.data.ctrl[:, self._platform_global_ctrl_ids] = vel
+
+
 def run_play(task_id: str, cfg: PlayConfig):
   configure_torch_backends()
 
@@ -170,7 +232,7 @@ def run_play(task_id: str, cfg: PlayConfig):
   if resolved_viewer == "native":
     NativeMujocoViewer(env, policy).run()
   elif resolved_viewer == "viser":
-    ViserPlayViewer(env, policy).run()
+    PlatformViserPlayViewer(env, policy).run()
   else:
     raise RuntimeError(f"Unsupported viewer backend: {resolved_viewer}")
 
